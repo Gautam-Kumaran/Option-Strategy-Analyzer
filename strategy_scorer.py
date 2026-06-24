@@ -227,10 +227,10 @@ def short_strangle(market, chain):
     pe_strike = market.get("max_put_oi_strike")
 
     if ce_strike is None or ce_strike <= S * 1.02:
-        ce_strike = nth_otm(chain, S, "CE", n=2)
+        ce_strike = nth_otm_strike(chain, S, "CE", n=2)
 
     if pe_strike is None or pe_strike >= S * 0.98:
-        pe_strike = nth_otm(chain, S, "PE", n=2)
+        pe_strike = nth_otm_strike(chain, S, "PE", n=2)
 
     call_prem = get_premium(chain, ce_strike, "CE")
     put_prem = get_premium(chain, pe_strike, "PE")
@@ -269,13 +269,16 @@ def iron_condor(market, chain):
     pe_strike = market.get("max_put_oi_strike")
 
     if ce_strike is None or ce_strike <= S * 1.02:
-        ce_strike = nth_otm(chain, S, "CE", n=2)
+        ce_strike = nth_otm_strike(chain, S, "CE", n=2)
 
     if pe_strike is None or pe_strike >= S * 0.98:
-        pe_strike = nth_otm(chain, S, "PE", n=2)
+        pe_strike = nth_otm_strike(chain, S, "PE", n=2)
+
+    sell_ce = ce_strike
+    sell_pe = pe_strike
     
-    buy_ce = nth_otm_strike(chain, sell_ce, "CE", n=1)
-    buy_pe = nth_otm_strike(chain, sell_pe, "PE", n=1)
+    buy_ce = nth_otm_strike(chain, S, "CE", n=1)
+    buy_pe = nth_otm_strike(chain, S, "PE", n=1)
 
     sell_ce_prem = get_premium(chain, sell_ce, "CE")
     buy_ce_prem = get_premium(chain, buy_ce, "CE")
@@ -448,22 +451,44 @@ def bear_call_spread(market, chain):
 # Strategy selection matrix
 # ─────────────────────────────────────────────
 
-STRATEGY_MATRIX = {
-    ("Low",  "Range-bound"): [long_straddle,   long_strangle],
-    ("Low",  "Bullish"):     [bull_call_spread, bull_put_spread],
-    ("Low",  "Bearish"):     [bear_put_spread,  bear_call_spread],
-    ("High", "Range-bound"): [short_strangle,   iron_condor],
-    ("High", "Bullish"):     [bull_put_spread,   iron_condor],
-    ("High", "Bearish"):     [bear_call_spread,  iron_condor],
-}
-
-
 def select_strategies(market):
-    iv_regime = market["iv_regime"]   # "Low" or "High"
-    trend = market["trend"]           # "Range-bound", "Bullish", "Bearish"
-    key = (iv_regime, trend)
-    return STRATEGY_MATRIX.get(key, [long_straddle, long_strangle])
+    iv = market["iv_regime"]        # "Low", "Neutral", "High"
+    direction = market["direction"]  # "Bullish", "Bearish", "Neutral", "Conflict"
+    adx = market["adx"]
 
+    # Conflict → no trade regardless of IV
+    if direction == "Conflict":
+        return []
+
+    if iv == "High":
+        if direction in ("Neutral", "Range-bound"):
+            return [iron_condor, short_strangle]
+        elif direction == "Bullish":
+            return [bull_put_spread, iron_condor]
+        elif direction == "Bearish":
+            return [bear_call_spread, iron_condor]
+
+    elif iv == "Low":
+        # Only recommend straddle/strangle if there's a breakout setup
+        has_breakout = adx >= 18 and direction in ("Bullish", "Bearish")
+        if has_breakout:
+            return [long_straddle, long_strangle]
+        elif direction == "Bullish":
+            return [bull_call_spread, bull_put_spread]
+        elif direction == "Bearish":
+            return [bear_put_spread, bear_call_spread]
+        else:
+            return []  # Low IV, Neutral direction → no trade
+
+    elif iv == "Neutral":
+        if direction == "Bullish":
+            return [bull_call_spread, bull_put_spread]
+        elif direction == "Bearish":
+            return [bear_put_spread, bear_call_spread]
+        else:
+            return []  # Neutral IV + Neutral direction → no trade
+
+    return []  # fallback
 
 # ─────────────────────────────────────────────
 # Pretty print
@@ -480,6 +505,12 @@ def pretty_print(market, results):
     print(f"  IV Rank: {market['iv_rank']:.1f}% [{market['iv_regime']} IV]  |  "
           f"Trend: {market['trend']}")
     print(sep)
+
+    if isinstance(results, dict) and results.get("no_trade"):
+        print(f"\n  ⚠  NO TRADE")
+        print(f"  {results['reason']}")
+        print(f"\n{SEP}\n")
+        return
 
     for i, r in enumerate(results, 1):
         print(f"\n  Recommendation {i}: {r['strategy'].upper()}  [{r['type'].upper()}]")
@@ -525,10 +556,38 @@ def pretty_print(market, results):
 # ─────────────────────────────────────────────
 # Orchestrator
 # ─────────────────────────────────────────────
+def _no_trade_reason(market):
+    iv = market["iv_regime"]
+    direction = market["direction"]
+    adx = market["adx"]
+
+    if direction == "Conflict":
+        return (
+            f"Signals conflict (score={market['direction_score']}): "
+            f"trend={market['trend']}, PCR={market['pcr_signal']}, "
+            f"support_broken={market.get('support_broken')}, "
+            f"resistance_broken={market.get('resistance_broken')}. "
+            f"No edge — sit out."
+        )
+    if iv == "Low" and adx < 18:
+        return (
+            f"Low IV (rank={market['iv_rank']}%) but no momentum "
+            f"(ADX={adx}). Straddle/strangle won't pay off. Sit out."
+        )
+    if iv in ("Low", "Neutral") and direction == "Neutral":
+        return (
+            f"{iv} IV and no directional edge. "
+            f"Nothing to trade — sit out."
+        )
+    return "No suitable strategy found for current market conditions."
 
 def score(market):
     chain = load_chain(market["symbol"], market["expiry"], market.get("as_of_date"))
     strategy_fns = select_strategies(market)
+    if not strategy_fns:
+        reason = _no_trade_reason(market)
+        return {"no_trade": True, "reason": reason}
+
     results = [fn(market, chain) for fn in strategy_fns]
     return results
 
@@ -555,9 +614,9 @@ def main():
             "market_analyser",
             os.path.join(os.path.dirname(__file__), "market_analyser.py")
         )
-        ma = importlib.util.load_from_spec(spec)
+        ma = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ma)
-        market = ma.analyse(args.symbol, date=args.date)
+        market = ma.analyse(args.symbol, as_of_date=args.date)
     else:
         print("Error: provide a symbol or pipe JSON from market_analyser.py")
         print("  python market_analyser.py HDFCBANK --json | python strategy_scorer.py")

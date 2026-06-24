@@ -111,7 +111,7 @@ def compute_iv_rank(opts: pd.DataFrame, as_of_date=None) -> dict:
 
     return {
         "iv_rank":    round(float(iv_rank), 1),
-        "iv_regime":  "High" if iv_rank >= 50 else "Low",
+        "iv_regime":  "High" if iv_rank >= 70 else ("Low" if iv_rank <= 30 else "Neutral"),
         "atm_iv":     round(float(atm_iv), 4),
         "spot":       round(float(spot), 2),
     }
@@ -228,12 +228,17 @@ def compute_oi_analysis(opts: pd.DataFrame, as_of_date=None) -> dict:
     near_resistance = abs(spot - max_call_strike) / spot < 0.02
     near_support    = abs(spot - max_put_strike)  / spot < 0.02
 
+    support_broken    = spot < max_put_strike
+    resistance_broken = spot > max_call_strike
+
     return {
         "max_call_oi_strike": max_call_strike,   # implied resistance
         "max_put_oi_strike":  max_put_strike,    # implied support
         "near_resistance":    bool(near_resistance),
         "near_support":       bool(near_support),
         "expiry":             str(nearest_expiry.date()),
+        "support_broken":     bool(support_broken),
+        "resistance_broken":  bool(resistance_broken),
     }
 
 
@@ -278,7 +283,55 @@ def compute_pcr(opts: pd.DataFrame, as_of_date=None) -> dict:
         "symbol":     str(raw_symbol),
     }
 
+def compute_direction(result: dict) -> dict:
+    """
+    Combine trend, PCR, and OI wall signals into a single directional score.
+    
+    Scoring:
+      +1 for each Bullish signal, -1 for each Bearish signal
+    
+    Signals used:
+      - SMA trend (Bullish / Bearish / Range-bound)
+      - PCR signal (Bullish / Bearish / Neutral)
+      - support_broken → Bearish
+      - resistance_broken → Bullish
+    
+    Output:
+      score ≥ +2  → Bullish
+      score ≤ -2  → Bearish
+      score = 0   → Neutral
+      |score| = 1 → Conflict (signals disagree, not strong enough either way)
+    """
+    score = 0
 
+    if result["trend"] == "Bullish":
+        score += 1
+    elif result["trend"] == "Bearish":
+        score -= 1
+
+    if result["pcr_signal"] == "Bullish":
+        score += 1
+    elif result["pcr_signal"] == "Bearish":
+        score -= 1
+
+    if result.get("resistance_broken"):
+        score += 1
+    if result.get("support_broken"):
+        score -= 1
+
+    if score >= 2:
+        direction = "Bullish"
+    elif score <= -2:
+        direction = "Bearish"
+    elif score == 0:
+        direction = "Neutral"
+    else:
+        direction = "Conflict"
+
+    return {
+        "direction":       direction,
+        "direction_score": score,
+    }
 # ── Main Analyser ─────────────────────────────────────────────────────────────
 
 def analyse(symbol: str, as_of_date=None) -> dict:
@@ -312,6 +365,9 @@ def analyse(symbol: str, as_of_date=None) -> dict:
     result.update(compute_oi_analysis(opts, as_of_date))
     result.update(compute_pcr(opts, as_of_date))
     result["as_of_date"] = str(as_of_date.date())
+
+    # Compute directional signal
+    result.update(compute_direction(result))
 
     return result
 
